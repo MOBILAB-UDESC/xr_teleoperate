@@ -234,6 +234,7 @@ kTopicGripperLeftCommand = "rt/dex1/left/cmd"
 kTopicGripperLeftState = "rt/dex1/left/state"
 kTopicGripperRightCommand = "rt/dex1/right/cmd"
 kTopicGripperRightState = "rt/dex1/right/state"
+Dex1_State_Timeout = 10.0  # seconds to wait for gripper state before running with the grippers that answered
 
 class Dex1_1_Gripper_Controller:
     def __init__(self, left_gripper_value_in, right_gripper_value_in, dual_gripper_data_lock = None, dual_gripper_state_out = None, dual_gripper_action_out = None, 
@@ -262,7 +263,6 @@ class Dex1_1_Gripper_Controller:
 
         self.fps = fps
         self.Unit_Test = Unit_Test
-        self.gripper_sub_ready = False
         self.simulation_mode = simulation_mode
         
         if filter and not self.simulation_mode:
@@ -276,23 +276,28 @@ class Dex1_1_Gripper_Controller:
         self.RightGripperCmb_publisher = ChannelPublisher(kTopicGripperRightCommand, MotorCmds_)
         self.RightGripperCmb_publisher.Init()
 
-        self.LeftGripperState_subscriber = ChannelSubscriber(kTopicGripperLeftState, MotorStates_)
-        self.LeftGripperState_subscriber.Init()
-        self.RightGripperState_subscriber = ChannelSubscriber(kTopicGripperRightState, MotorStates_)
-        self.RightGripperState_subscriber.Init()
-
         # Shared Arrays for gripper states
         self.left_gripper_state_value = Value('d', 0.0, lock=True)
         self.right_gripper_state_value = Value('d', 0.0, lock=True)
 
-        # initialize subscribe thread
-        self.subscribe_state_thread = threading.Thread(target=self._subscribe_gripper_state)
-        self.subscribe_state_thread.daemon = True
-        self.subscribe_state_thread.start()
+        # Callbacks rather than a Read() loop on both grippers: a missing gripper must not block the other one.
+        self.left_gripper_present = Value('b', False)
+        self.right_gripper_present = Value('b', False)
+        self.LeftGripperState_subscriber = ChannelSubscriber(kTopicGripperLeftState, MotorStates_)
+        self.LeftGripperState_subscriber.Init(self._gripper_state_handler(self.left_gripper_state_value, self.left_gripper_present), 10)
+        self.RightGripperState_subscriber = ChannelSubscriber(kTopicGripperRightState, MotorStates_)
+        self.RightGripperState_subscriber.Init(self._gripper_state_handler(self.right_gripper_state_value, self.right_gripper_present), 10)
 
-        while not self.gripper_sub_ready:
+        start = time.time()
+        while not (self.left_gripper_present.value and self.right_gripper_present.value) and time.time() - start < Dex1_State_Timeout:
             time.sleep(0.01)
             logger_mp.warning("[Dex1_1_Gripper_Controller] Waiting to subscribe dds...")
+        if not (self.left_gripper_present.value or self.right_gripper_present.value):
+            raise RuntimeError(f"[Dex1_1_Gripper_Controller] No state on {kTopicGripperLeftState} or {kTopicGripperRightState} after {Dex1_State_Timeout:.0f} s.")
+        if not self.left_gripper_present.value:
+            logger_mp.warning("[Dex1_1_Gripper_Controller] No state from the left gripper; controlling the right gripper only.")
+        if not self.right_gripper_present.value:
+            logger_mp.warning("[Dex1_1_Gripper_Controller] No state from the right gripper; controlling the left gripper only.")
         logger_mp.info("[Dex1_1_Gripper_Controller] Subscribe dds ok.")
 
         self.gripper_control_thread = threading.Thread(target=self.control_thread, args=(left_gripper_value_in, right_gripper_value_in, self.left_gripper_state_value, self.right_gripper_state_value,
@@ -302,23 +307,22 @@ class Dex1_1_Gripper_Controller:
 
         logger_mp.info("Initialize Dex1_1_Gripper_Controller OK!")
 
-    def _subscribe_gripper_state(self):
-        while True:
-            left_gripper_msg  = self.LeftGripperState_subscriber.Read()
-            right_gripper_msg  = self.RightGripperState_subscriber.Read()
-            if left_gripper_msg is not None and right_gripper_msg is not None:
-                self.left_gripper_state_value.value = left_gripper_msg.states[0].q
-                self.right_gripper_state_value.value = right_gripper_msg.states[0].q
-                self.gripper_sub_ready = True
-            time.sleep(0.002)
-    
+    @staticmethod
+    def _gripper_state_handler(state_value, present):
+        def handler(msg):
+            state_value.value = msg.states[0].q
+            present.value = True
+        return handler
+
     def ctrl_dual_gripper(self, dual_gripper_action):
-        """set current left, right gripper motor cmd target q"""
+        """set current left, right gripper motor cmd target q (only to the grippers that answered)"""
         self.left_gripper_msg.cmds[0].q  = dual_gripper_action[0]
         self.right_gripper_msg.cmds[0].q = dual_gripper_action[1]
 
-        self.LeftGripperCmb_publisher.Write(self.left_gripper_msg)
-        self.RightGripperCmb_publisher.Write(self.right_gripper_msg)
+        if self.left_gripper_present.value:
+            self.LeftGripperCmb_publisher.Write(self.left_gripper_msg)
+        if self.right_gripper_present.value:
+            self.RightGripperCmb_publisher.Write(self.right_gripper_msg)
         # logger_mp.debug("gripper ctrl publish ok.")
     
     def control_thread(self, left_gripper_value_in, right_gripper_value_in, left_gripper_state_value, right_gripper_state_value, dual_hand_data_lock = None, 
