@@ -20,6 +20,7 @@ from teleimager.image_client import ImageClient
 from teleop.utils.episode_writer import EpisodeWriter
 from teleop.utils.ipc import IPC_Server
 from teleop.utils.motion_switcher import MotionSwitcher, LocoClientWrapper
+from teleop.utils.button_release import ButtonRelease
 from sshkeyboard import listen_keyboard, stop_listening
 
 # for simulation
@@ -273,6 +274,8 @@ if __name__ == '__main__':
 
         logger_mp.info("----------------------------------------------------------------")
         logger_mp.info("🟢  Press [r] to start syncing the robot with your movements.")
+        if args.input_mode == "controller":
+            logger_mp.info("🟢  Or press and release [A] on the right controller.")
         if args.record:
             logger_mp.info("🟡  Press [s] to START or SAVE recording (toggle cycle).")
         else:
@@ -280,8 +283,11 @@ if __name__ == '__main__':
         logger_mp.info("🔴  Press [q] to stop and exit the program.")
         logger_mp.info("⚠️  IMPORTANT: Please keep your distance and stay safe.")
         READY = True                  # now ready to (1) enter START state
+        start_button = ButtonRelease()
         while not START and not STOP: # wait for start or stop signal.
             time.sleep(0.033)
+            if args.input_mode == "controller" and start_button.update(tv_wrapper.get_tele_data().right_ctrl_aButton):
+                START = True          # right A pressed and released, same as [r]
             if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
                 head_img = img_client.get_head_frame()
                 if head_img.bgr is not None:
