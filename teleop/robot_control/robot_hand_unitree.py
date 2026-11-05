@@ -235,16 +235,43 @@ kTopicGripperLeftState = "rt/dex1/left/state"
 kTopicGripperRightCommand = "rt/dex1/right/cmd"
 kTopicGripperRightState = "rt/dex1/right/state"
 Dex1_State_Timeout = 10.0  # seconds to wait for gripper state before running with the grippers that answered
+DEX1_Q_CLOSED, DEX1_Q_OPEN = 0.0, 5.4  # gripper motor position range, rad
+DEX1_DELTA_CMD = 0.18          # max distance between command and measured position, rad (bounds the grip force)
+DEX1_TRIGGER_GRIP_SPEED = 3.6  # rad/s with the trigger or grip fully pulled: about 1.5 s from open to closed
+DEX1_TRIGGER_GRIP_DEADZONE = 0.05  # pull fraction ignored, so a finger resting on the trigger doesn't move it
+
+
+def dex1_trigger_grip_target(target, state, trigger_value, squeeze_value, dt):
+    """Next gripper target (rad) for the controllers: the index trigger closes, the middle-finger grip opens.
+
+    trigger_value: televuer's 10.0 (released) to 0.0 (fully pulled); squeeze_value: 0.0 (released) to 1.0.
+    How deep they are pulled sets the speed; with neither pulled the target stays, so the gripper keeps
+    holding what it grasped. The target stays within DEX1_DELTA_CMD of the measured position: on a blocked
+    jaw it doesn't run away, so the grip force stays bounded and the grip opens again at once.
+    """
+    close = float(np.clip((10.0 - trigger_value) / 10.0, 0.0, 1.0))
+    open_ = float(np.clip(squeeze_value, 0.0, 1.0))
+    close = 0.0 if close < DEX1_TRIGGER_GRIP_DEADZONE else close
+    open_ = 0.0 if open_ < DEX1_TRIGGER_GRIP_DEADZONE else open_
+    target = target + (open_ - close) * DEX1_TRIGGER_GRIP_SPEED * dt
+    target = min(max(target, state - DEX1_DELTA_CMD), state + DEX1_DELTA_CMD)
+    return min(max(target, DEX1_Q_CLOSED), DEX1_Q_OPEN)
+
 
 class Dex1_1_Gripper_Controller:
     def __init__(self, left_gripper_value_in, right_gripper_value_in, dual_gripper_data_lock = None, dual_gripper_state_out = None, dual_gripper_action_out = None, 
-                       filter = True, fps = 200.0, Unit_Test = False, simulation_mode = False, xr_motion_data_ready_in = None):
+                       filter = True, fps = 200.0, Unit_Test = False, simulation_mode = False, xr_motion_data_ready_in = None,
+                       left_gripper_squeeze_in = None, right_gripper_squeeze_in = None):
         """
         [note] A *_array type parameter requires using a multiprocessing Array, because it needs to be passed to the internal child process
 
-        left_gripper_value_in: [input] Left ctrl data (required from XR device) to control_thread
+        left_gripper_value_in: [input] Left ctrl data (required from XR device) to control_thread: the hand pinch
+            value, or with *_squeeze_in the controller's trigger value
 
         right_gripper_value_in: [input] Right ctrl data (required from XR device) to control_thread
+
+        left_gripper_squeeze_in, right_gripper_squeeze_in: [input] controller grip values (0.0 to 1.0). Given, the
+            controllers drive the grippers hold-to-move (dex1_trigger_grip_target): trigger closes, grip opens.
 
         dual_gripper_data_lock: Data synchronization lock for dual_gripper_state_array and dual_gripper_action_array
 
@@ -301,7 +328,8 @@ class Dex1_1_Gripper_Controller:
         logger_mp.info("[Dex1_1_Gripper_Controller] Subscribe dds ok.")
 
         self.gripper_control_thread = threading.Thread(target=self.control_thread, args=(left_gripper_value_in, right_gripper_value_in, self.left_gripper_state_value, self.right_gripper_state_value,
-                                                                                         dual_gripper_data_lock, dual_gripper_state_out, dual_gripper_action_out, xr_motion_data_ready_in))
+                                                                                         dual_gripper_data_lock, dual_gripper_state_out, dual_gripper_action_out, xr_motion_data_ready_in,
+                                                                                         left_gripper_squeeze_in, right_gripper_squeeze_in))
         self.gripper_control_thread.daemon = True
         self.gripper_control_thread.start()
 
@@ -326,9 +354,11 @@ class Dex1_1_Gripper_Controller:
         # logger_mp.debug("gripper ctrl publish ok.")
     
     def control_thread(self, left_gripper_value_in, right_gripper_value_in, left_gripper_state_value, right_gripper_state_value, dual_hand_data_lock = None, 
-                             dual_gripper_state_out = None, dual_gripper_action_out = None, xr_motion_data_ready_in = None):
+                             dual_gripper_state_out = None, dual_gripper_action_out = None, xr_motion_data_ready_in = None,
+                             left_gripper_squeeze_in = None, right_gripper_squeeze_in = None):
         self.running = True
-        DELTA_GRIPPER_CMD = 0.18     # The motor rotates 5.4 radians, the clamping jaw slide open 9 cm, so 0.6 rad <==> 1 cm, 0.18 rad <==> 3 mm
+        trigger_grip = left_gripper_squeeze_in is not None and right_gripper_squeeze_in is not None
+        DELTA_GRIPPER_CMD = DEX1_DELTA_CMD     # The motor rotates 5.4 radians, the clamping jaw slide open 9 cm, so 0.6 rad <==> 1 cm, 0.18 rad <==> 3 mm
         THUMB_INDEX_DISTANCE_MIN = 5.0
         THUMB_INDEX_DISTANCE_MAX = 7.0
         LEFT_MAPPED_MIN  = 0.0           # The minimum initial motor position when the gripper closes at startup.
@@ -338,6 +368,9 @@ class Dex1_1_Gripper_Controller:
         RIGHT_MAPPED_MAX = RIGHT_MAPPED_MIN + 5.40
         left_target_action  = (LEFT_MAPPED_MAX - LEFT_MAPPED_MIN) / 2.0
         right_target_action = (RIGHT_MAPPED_MAX - RIGHT_MAPPED_MIN) / 2.0
+        if trigger_grip:  # hold-to-move starts where the grippers are
+            left_target_action, right_target_action = left_gripper_state_value.value, right_gripper_state_value.value
+        dt = 1.0 / self.fps
 
         dq = 0.0
         tau = 0.0
@@ -374,7 +407,14 @@ class Dex1_1_Gripper_Controller:
                 # get current dual gripper motor state
                 dual_gripper_state = np.array([left_gripper_state_value.value, right_gripper_state_value.value])
 
-                if xr_motion_data_ready:
+                if xr_motion_data_ready and trigger_grip:
+                    with left_gripper_squeeze_in.get_lock():
+                        left_squeeze_value = left_gripper_squeeze_in.value
+                    with right_gripper_squeeze_in.get_lock():
+                        right_squeeze_value = right_gripper_squeeze_in.value
+                    left_target_action  = dex1_trigger_grip_target(left_target_action, dual_gripper_state[0], left_gripper_value, left_squeeze_value, dt)
+                    right_target_action = dex1_trigger_grip_target(right_target_action, dual_gripper_state[1], right_gripper_value, right_squeeze_value, dt)
+                elif xr_motion_data_ready:
                     # Linear mapping from [0, THUMB_INDEX_DISTANCE_MAX] to gripper action range
                     left_target_action  = np.interp(left_gripper_value, [THUMB_INDEX_DISTANCE_MIN, THUMB_INDEX_DISTANCE_MAX], [LEFT_MAPPED_MIN, LEFT_MAPPED_MAX])
                     right_target_action = np.interp(right_gripper_value, [THUMB_INDEX_DISTANCE_MIN, THUMB_INDEX_DISTANCE_MAX], [RIGHT_MAPPED_MIN, RIGHT_MAPPED_MAX])

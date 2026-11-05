@@ -199,13 +199,23 @@ if __name__ == '__main__':
                                           dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim, xr_motion_data_ready_in=xr_motion_data_ready)
         elif args.ee == "dex1":
             from teleop.robot_control.robot_hand_unitree import Dex1_1_Gripper_Controller
-            left_gripper_value = Value('d', 0.0, lock=True)        # [input]
-            right_gripper_value = Value('d', 0.0, lock=True)       # [input]
             dual_gripper_data_lock = Lock()
             dual_gripper_state_array = Array('d', 2, lock=False)   # current left, right gripper state(2) data.
             dual_gripper_action_array = Array('d', 2, lock=False)  # current left, right gripper action(2) data.
+            if args.input_mode == "controller":
+                # controllers: index trigger closes, middle-finger grip opens (hold-to-move)
+                left_gripper_value = Value('d', 10.0, lock=True)       # [input] trigger, 10.0 = released
+                right_gripper_value = Value('d', 10.0, lock=True)      # [input]
+                left_gripper_squeeze_in = Value('d', 0.0, lock=True)   # [input] grip, 0.0 = released
+                right_gripper_squeeze_in = Value('d', 0.0, lock=True)  # [input]
+                squeeze_in = dict(left_gripper_squeeze_in=left_gripper_squeeze_in, right_gripper_squeeze_in=right_gripper_squeeze_in)
+            else:
+                left_gripper_value = Value('d', 0.0, lock=True)        # [input]
+                right_gripper_value = Value('d', 0.0, lock=True)       # [input]
+                squeeze_in = {}
             gripper_ctrl = Dex1_1_Gripper_Controller(left_gripper_value, right_gripper_value, dual_gripper_data_lock, 
-                                                     dual_gripper_state_array, dual_gripper_action_array, simulation_mode=args.sim, xr_motion_data_ready_in=xr_motion_data_ready)
+                                                     dual_gripper_state_array, dual_gripper_action_array, simulation_mode=args.sim, xr_motion_data_ready_in=xr_motion_data_ready,
+                                                     **squeeze_in)
         elif args.ee == "inspire_dfx":
             from teleop.robot_control.robot_hand_inspire import Inspire_Controller_DFX
             left_hand_pos_array = Array('d', 75, lock = True)      # [input]
@@ -334,6 +344,11 @@ if __name__ == '__main__':
                     left_gripper_value.value = tele_data.left_ctrl_triggerValue
                 with right_gripper_value.get_lock():
                     right_gripper_value.value = tele_data.right_ctrl_triggerValue
+                if args.ee == "dex1":
+                    with left_gripper_squeeze_in.get_lock():
+                        left_gripper_squeeze_in.value = tele_data.left_ctrl_squeezeValue
+                    with right_gripper_squeeze_in.get_lock():
+                        right_gripper_squeeze_in.value = tele_data.right_ctrl_squeezeValue
             elif args.ee in ("dex1", "dex1_internal") and args.input_mode == "hand":
                 with left_gripper_value.get_lock():
                     left_gripper_value.value = tele_data.left_hand_pinchValue
