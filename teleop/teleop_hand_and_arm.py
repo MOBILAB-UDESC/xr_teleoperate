@@ -2,6 +2,7 @@ import time
 import argparse
 from multiprocessing import Value, Array, Lock
 import threading
+import numpy as np
 import logging_mp
 logging_mp.basicConfig(level=logging_mp.INFO)
 logger_mp = logging_mp.getLogger(__name__)
@@ -49,6 +50,10 @@ RECORD_TOGGLE  = False  # Toggle recording state
 #  --> auto  : Auto-transition after saving data.
 
 def on_press(key):
+    """Keyboard / IPC handler.
+    r: start (or resume) teleop    a: pause teleop
+    s: start / save recording      q: quit
+    """
     global STOP, START, RECORD_TOGGLE
     if key == 'r':
         START = True
@@ -57,6 +62,8 @@ def on_press(key):
         STOP = True
     elif key == 's' and START == True:
         RECORD_TOGGLE = True
+    elif key == 'a':
+        START = False
     else:
         logger_mp.warning(f"[on_press] {key} was pressed, but no action is defined for this key.")
 
@@ -69,6 +76,28 @@ def get_state() -> dict:
         "READY": READY,
         "RECORD_RUNNING": RECORD_RUNNING,
     }
+
+def handle_controller_buttons(tele_data, prev, record_enabled):
+    """Rising-edge detection for Quest buttons. Mutates the same globals the keyboard handler uses.
+    Right A: quit | Right B: pause teleop | Left X: start/resume teleop | Left Y: start/save recording
+    """
+    global START, STOP, RECORD_TOGGLE
+    a = bool(tele_data.right_ctrl_aButton)   # A: quit
+    b = bool(tele_data.right_ctrl_bButton)   # B: stop teleop
+    x = bool(tele_data.left_ctrl_aButton)    # X: start teleop
+    y = bool(tele_data.left_ctrl_bButton)    # Y: record toggle
+
+    if a and not prev["A"]:
+        START = False
+        STOP = True
+    if b and not prev["B"]:
+        START = False
+    if x and not prev["X"]:
+        START = True
+    if y and not prev["Y"] and START and record_enabled:
+        RECORD_TOGGLE = True
+
+    prev.update(A=a, B=b, X=x, Y=y)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -86,6 +115,9 @@ if __name__ == '__main__':
     parser.add_argument('--headless', action='store_true', help='Enable headless mode (no display)')
     parser.add_argument('--sim', action = 'store_true', help = 'Enable isaac simulation mode')
     parser.add_argument('--ipc', action = 'store_true', help = 'Enable IPC server to handle input; otherwise enable sshkeyboard')
+    # resume-after-pause behaviour
+    parser.add_argument('--resume-ramp', type = float, default = 1.0, help = 'seconds to smoothly blend from the pause pose to the operator pose after a resume (0 = disabled, arms jump straight to the target)')
+    parser.add_argument('--resume-tol', type = float, default = 0.0, help = 'max joint error (rad) between the pause pose and the operator pose allowed to resume; above it the arms stay still until the operator aligns their hands (0 = disabled)')
     # record mode and task info
     parser.add_argument('--record', action = 'store_true', help = 'Enable data recording mode')
     parser.add_argument('--task-dir', type = str, default = './utils/data/', help = 'path to save data')
@@ -199,13 +231,23 @@ if __name__ == '__main__':
                                           dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim, xr_motion_data_ready_in=xr_motion_data_ready)
         elif args.ee == "dex1":
             from teleop.robot_control.robot_hand_unitree import Dex1_1_Gripper_Controller
-            left_gripper_value = Value('d', 0.0, lock=True)        # [input]
-            right_gripper_value = Value('d', 0.0, lock=True)       # [input]
             dual_gripper_data_lock = Lock()
             dual_gripper_state_array = Array('d', 2, lock=False)   # current left, right gripper state(2) data.
             dual_gripper_action_array = Array('d', 2, lock=False)  # current left, right gripper action(2) data.
-            gripper_ctrl = Dex1_1_Gripper_Controller(left_gripper_value, right_gripper_value, dual_gripper_data_lock, 
-                                                     dual_gripper_state_array, dual_gripper_action_array, simulation_mode=args.sim, xr_motion_data_ready_in=xr_motion_data_ready)
+            if args.input_mode == "controller":
+                # controllers: index trigger closes, middle-finger grip opens (hold-to-move)
+                left_gripper_value = Value('d', 10.0, lock=True)       # [input] trigger, 10.0 = released
+                right_gripper_value = Value('d', 10.0, lock=True)      # [input]
+                left_gripper_squeeze_in = Value('d', 0.0, lock=True)   # [input] grip, 0.0 = released
+                right_gripper_squeeze_in = Value('d', 0.0, lock=True)  # [input]
+                squeeze_in = dict(left_gripper_squeeze_in=left_gripper_squeeze_in, right_gripper_squeeze_in=right_gripper_squeeze_in)
+            else:
+                left_gripper_value = Value('d', 0.0, lock=True)        # [input]
+                right_gripper_value = Value('d', 0.0, lock=True)       # [input]
+                squeeze_in = {}
+            gripper_ctrl = Dex1_1_Gripper_Controller(left_gripper_value, right_gripper_value, dual_gripper_data_lock,
+                                                     dual_gripper_state_array, dual_gripper_action_array, simulation_mode=args.sim, xr_motion_data_ready_in=xr_motion_data_ready,
+                                                     **squeeze_in)
         elif args.ee == "inspire_dfx":
             from teleop.robot_control.robot_hand_inspire import Inspire_Controller_DFX
             left_hand_pos_array = Array('d', 75, lock = True)      # [input]
@@ -262,13 +304,33 @@ if __name__ == '__main__':
                                      rerun_log = not args.headless)
 
         logger_mp.info("----------------------------------------------------------------")
-        logger_mp.info("🟢  Press [r] to start syncing the robot with your movements.")
+        logger_mp.info("🟢  Press [r] to start (or resume) syncing the robot with your movements.")
+        logger_mp.info("🟠  Press [a] to pause syncing (the program keeps running).")
         if args.record:
             logger_mp.info("🟡  Press [s] to START or SAVE recording (toggle cycle).")
         else:
             logger_mp.info("🔵  Recording is DISABLED (run with --record to enable).")
         logger_mp.info("🔴  Press [q] to stop and exit the program.")
+        if args.input_mode == "controller":
+            logger_mp.info("QUEST COMMANDS:")
+            logger_mp.info("[Right A] quit.")
+            logger_mp.info("[Right B] pause Teleop.")
+            logger_mp.info("[Left X] start or resume Teleop.")
+            if args.record:
+                logger_mp.info("[Left Y] start or save Recording.")
+        if args.resume_tol > 0:
+            logger_mp.info(f"ℹ️  After a pause, keep your hands near the pause pose (tolerance {args.resume_tol:.2f} rad) to resume.")
+        elif args.resume_ramp > 0:
+            logger_mp.info(f"ℹ️  After a pause, the arms resume from the pause pose and blend to your hands over {args.resume_ramp:.1f}s.")
         logger_mp.info("⚠️  IMPORTANT: Please keep your distance and stay safe.")
+
+        prev_btn = {"A": False, "B": False, "X": False, "Y": False}  # previous Quest button states (rising-edge detection)
+        was_tracking = True           # used by the pause gate to run the pause actions only once
+        resume_pending = False        # True from the moment teleop is paused until the arms are released again
+        resume_ramping = False        # True while blending from the pause pose to the operator pose
+        resume_start_q = None         # arm joint positions at the moment of resuming (= pause pose)
+        resume_t0 = 0.0               # time at which the blend started
+        last_resume_warn = 0.0        # throttles the "align your hands" warning
         READY = True                  # now ready to (1) enter START state
         while not START and not STOP: # wait for start or stop signal.
             time.sleep(0.033)
@@ -276,6 +338,8 @@ if __name__ == '__main__':
                 head_img = img_client.get_head_frame()
                 if head_img.bgr is not None:
                     tv_wrapper.render_to_xr(head_img.bgr)
+            if args.input_mode == "controller":
+                handle_controller_buttons(tv_wrapper.get_tele_data(), prev_btn, args.record)
 
         logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
 
@@ -315,6 +379,8 @@ if __name__ == '__main__':
 
             # get xr's tele data
             tele_data = tv_wrapper.get_tele_data()
+            if args.input_mode == "controller":
+                handle_controller_buttons(tele_data, prev_btn, args.record)
             if args.ee in ("dex3", "inspire_ftp", "inspire_dfx", "brainco")  and args.input_mode == "hand":
                 with left_hand_pos_array.get_lock():
                     left_hand_pos_array[:] = tele_data.left_hand_pos.flatten()
@@ -334,6 +400,11 @@ if __name__ == '__main__':
                     left_gripper_value.value = tele_data.left_ctrl_triggerValue
                 with right_gripper_value.get_lock():
                     right_gripper_value.value = tele_data.right_ctrl_triggerValue
+                if args.ee == "dex1":
+                    with left_gripper_squeeze_in.get_lock():
+                        left_gripper_squeeze_in.value = tele_data.left_ctrl_squeezeValue
+                    with right_gripper_squeeze_in.get_lock():
+                        right_gripper_squeeze_in.value = tele_data.right_ctrl_squeezeValue
             elif args.ee in ("dex1", "dex1_internal") and args.input_mode == "hand":
                 with left_gripper_value.get_lock():
                     left_gripper_value.value = tele_data.left_hand_pinchValue
@@ -346,10 +417,6 @@ if __name__ == '__main__':
             
             # high level control
             if args.input_mode == "controller" and args.motion:
-                # quit teleoperate
-                if tele_data.right_ctrl_aButton:
-                    START = False
-                    STOP = True
                 # command robot to enter damping mode. soft emergency stop function
                 if tele_data.left_ctrl_thumbstick and tele_data.right_ctrl_thumbstick:
                     loco_wrapper.Damp()
@@ -357,6 +424,22 @@ if __name__ == '__main__':
                 loco_wrapper.Move(-tele_data.left_ctrl_thumbstickValue[1] * 0.3,
                                   -tele_data.left_ctrl_thumbstickValue[0] * 0.3,
                                   -tele_data.right_ctrl_thumbstickValue[0]* 0.3)
+
+            # pause gate (runs in every mode): while paused, arm IK/control and recording are skipped
+            if not START:
+                if was_tracking:
+                    was_tracking = False
+                    resume_pending = True            # next START re-enters through the soft-resume logic
+                    resume_ramping = False
+                    if RECORD_RUNNING:               # don't leave a recording open
+                        RECORD_RUNNING = False
+                        recorder.save_episode()
+                        if args.sim:
+                            publish_reset_category(1, reset_pose_publisher)
+                    # arm_ctrl.ctrl_dual_arm_go_home()
+                time.sleep(1 / args.frequency)
+                continue
+            was_tracking = True
 
             # get current robot state data.
             current_lr_arm_q  = arm_ctrl.get_current_dual_arm_q()
@@ -367,6 +450,32 @@ if __name__ == '__main__':
             sol_q, sol_tauff  = arm_ik.solve_ik(tele_data.left_wrist_pose, tele_data.right_wrist_pose, current_lr_arm_q, current_lr_arm_dq)
             time_ik_end = time.time()
             logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
+
+            # soft resume: after a pause, start from the pose where the arms stopped instead of jumping to the operator's hands
+            if resume_pending:
+                if args.resume_tol > 0:
+                    # optional gate: keep the arms still until the operator's pose is close to the pause pose
+                    resume_err = float(np.max(np.abs(np.asarray(sol_q) - np.asarray(current_lr_arm_q))))
+                    if resume_err > args.resume_tol:
+                        if time.time() - last_resume_warn > 1.0:
+                            last_resume_warn = time.time()
+                            logger_mp.warning(f"Resume waiting: move your hands closer to the pause pose "
+                                              f"(max joint error {resume_err:.2f} rad > {args.resume_tol:.2f} rad)")
+                        time.sleep(1 / args.frequency)
+                        continue
+                resume_start_q = np.array(current_lr_arm_q, dtype=float)   # measured pose = where the arms paused
+                resume_t0 = time.time()
+                resume_pending = False
+                resume_ramping = args.resume_ramp > 0
+                logger_mp.info("▶️  Resuming teleop from the pause pose.")
+            if resume_ramping:
+                alpha = min(1.0, (time.time() - resume_t0) / args.resume_ramp)
+                alpha_s = alpha * alpha * (3.0 - 2.0 * alpha)              # smoothstep: gentle start and end
+                sol_q = resume_start_q + alpha_s * (np.asarray(sol_q) - resume_start_q)
+                # sol_tauff is left as computed by the IK solver
+                if alpha >= 1.0:
+                    resume_ramping = False
+
             arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
 
             # record data
